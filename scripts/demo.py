@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 import tempfile
@@ -20,7 +21,12 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from inspection_store import BatchAborted, DeviceStore, Edit  # noqa: E402
+from inspection_store import (  # noqa: E402
+    BatchAborted,
+    DeviceStore,
+    Edit,
+    StaleLocal,
+)
 from inspection_store.export import export_csv  # noqa: E402
 
 
@@ -133,7 +139,35 @@ def main() -> int:
     store.verify()
     print("verify: ok")
 
-    heading(f"8. {args.scale:,}-slot middle insert")
+    heading("8. offline three-way merge of one device")
+    store.import_document(
+        "CREW",
+        {"section": [{"fields": {"torque": 10}}, None, {"fields": {"reading": 3}}]},
+    )
+    base_draft = store.checkout_document("CREW")
+    print("checkout keeps ids and shapes:",
+          [element["id"][:8] for element in base_draft["section"]])
+    # The returned crew changed one field and added a slot; the local crew
+    # changed nothing, so the store still equals the local draft.
+    returned = json.loads(json.dumps(base_draft))
+    returned["section"][0]["slot"]["fields"]["torque"] = 12
+    returned["section"].insert(
+        1, {"id": "CREW-NEW-1", "slot": {"fields": {"reading": 4}}}
+    )
+    stats = store.merge_document("CREW", base_draft, base_draft, returned)
+    print("merge stats:", stats)
+    print("merged order:", [row["slot_id"] for row in store.page("CREW", 0, 10)])
+    print("merged torque:", store.load_document("CREW")["section"][0]["fields"])
+    try:
+        store.merge_document("CREW", base_draft, base_draft, returned)
+        print("ERROR: stale local draft accepted")
+        return 1
+    except StaleLocal as exc:
+        print("re-running the same merge is stale:", exc)
+    store.verify()
+    print("verify: ok")
+
+    heading(f"9. {args.scale:,}-slot middle insert")
     start = time.time()
     store.import_document(
         "BIG", {"section": [{"fields": {"i": i}} for i in range(args.scale)]}

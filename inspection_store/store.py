@@ -59,6 +59,21 @@ from .codec import (
     check_slot_fields,
     dumps_value,
     loads_scalar,
+    normalize_device_doc,
+)
+from .merge import (
+    AttDraft,
+    Draft,
+    MergeConflict,
+    SlotDraft,
+    StaleLocal,
+    draft_ids,
+    draft_import_ids,
+    draft_to_json,
+    draft_to_plain_document,
+    first_difference,
+    merge_drafts,
+    parse_draft,
 )
 
 SCHEMA_VERSION = 1
@@ -178,6 +193,47 @@ def priority_for(slot_id: str) -> int:
     """
     digest = hashlib.sha256(slot_id.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+
+def _stored_fields(fields_json: str) -> Tuple[Tuple[str, Any], ...]:
+    """A stored fields_json as a sorted (name, scalar) tuple."""
+    return tuple(sorted(loads_scalar(fields_json).items()))
+
+
+def _walk_rows(
+    rows_by_id: Dict[str, Tuple[Any, ...]],
+    root: Optional[str],
+    left_index: int,
+    right_index: int,
+    label: str,
+) -> List[str]:
+    """In-order slot ids of one array from already-fetched rows.
+
+    Used by the draft reader: the rows come from a handful of bulk queries
+    inside one transaction, and the treap links are followed in memory.
+    """
+    order: List[str] = []
+    stack: List[Tuple[Any, ...]] = []
+    visited: set = set()
+    current = root
+    while stack or current is not None:
+        while current is not None:
+            if current in visited:
+                raise IntegrityError(f"{label}: cycle at slot {current!r}")
+            visited.add(current)
+            row = rows_by_id.get(current)
+            if row is None:
+                raise IntegrityError(f"{label}: dangling slot id {current!r}")
+            stack.append(row)
+            current = row[left_index]
+        row = stack.pop()
+        order.append(row[0])
+        current = row[right_index]
+    if len(order) != len(rows_by_id):
+        raise IntegrityError(
+            f"{label}: {len(rows_by_id) - len(order)} slot rows are unreachable"
+        )
+    return order
 
 
 # ---------------------------------------------------------------------------
@@ -1238,8 +1294,6 @@ class DeviceStore:
         the section absent, null, or a list.  Stable slot ids are generated;
         pass ``id_factory(kind, ordinal)`` to control them.
         """
-        from .codec import normalize_device_doc, SlotDoc
-
         normalized = normalize_device_doc(device_key, document)
         if id_factory is None:
             counter = {"section": 0, "attachment": 0}
@@ -1249,52 +1303,66 @@ class DeviceStore:
 
         stats = {"section_slots": 0, "attachment_slots": 0}
         with self._transaction():
-            exists = self.conn.execute(
-                "SELECT 1 FROM device WHERE device_key = ?", (device_key,)
-            ).fetchone()
-            if exists is not None:
-                if not replace:
-                    raise StoreError(f"device {device_key!r} already exists")
-                # Cascades remove slots; history is not kept.
-                self.conn.execute(
-                    "DELETE FROM attachment_slot WHERE section_slot_id IN "
-                    "(SELECT slot_id FROM section_slot WHERE device_key = ?)",
-                    (device_key,),
-                )
-                self.conn.execute(
-                    "DELETE FROM section_slot WHERE device_key = ?", (device_key,)
-                )
-                self.conn.execute(
-                    "DELETE FROM device WHERE device_key = ?", (device_key,)
-                )
-
-            if normalized.section is ABSENT:
-                shape, root = CODE_ABSENT, None
-            elif normalized.section is None:
-                shape, root = CODE_NULL, None
-            elif not normalized.section:
-                shape, root = CODE_EMPTY, None
-            else:
-                shape = CODE_PRESENT
-                root = None
-            # A present array's root is not known until its slots exist; the
-            # device row temporarily records an empty array inside this same
-            # transaction, then is updated to "present".
-            self.conn.execute(
-                "INSERT INTO device(device_key, section_shape, section_root) "
-                "VALUES (?, ?, ?)",
-                (device_key, CODE_EMPTY if shape == CODE_PRESENT else shape, root),
+            self._replace_document_rows(
+                device_key, normalized, id_factory, replace=replace, stats=stats
             )
-            if shape == CODE_PRESENT:
-                root = self._import_section_array(
-                    device_key, normalized.section, id_factory, stats
-                )
-                self.conn.execute(
-                    "UPDATE device SET section_shape = ?, section_root = ? "
-                    "WHERE device_key = ?",
-                    (CODE_PRESENT, root, device_key),
-                )
         return stats
+
+    def _replace_document_rows(
+        self,
+        device_key: str,
+        normalized: Any,
+        id_factory: Any,
+        *,
+        replace: bool,
+        stats: Dict[str, int],
+    ) -> None:
+        """Insert one device's rows; must run inside an open transaction."""
+        exists = self.conn.execute(
+            "SELECT 1 FROM device WHERE device_key = ?", (device_key,)
+        ).fetchone()
+        if exists is not None:
+            if not replace:
+                raise StoreError(f"device {device_key!r} already exists")
+            # Cascades remove slots; history is not kept.
+            self.conn.execute(
+                "DELETE FROM attachment_slot WHERE section_slot_id IN "
+                "(SELECT slot_id FROM section_slot WHERE device_key = ?)",
+                (device_key,),
+            )
+            self.conn.execute(
+                "DELETE FROM section_slot WHERE device_key = ?", (device_key,)
+            )
+            self.conn.execute(
+                "DELETE FROM device WHERE device_key = ?", (device_key,)
+            )
+
+        if normalized.section is ABSENT:
+            shape, root = CODE_ABSENT, None
+        elif normalized.section is None:
+            shape, root = CODE_NULL, None
+        elif not normalized.section:
+            shape, root = CODE_EMPTY, None
+        else:
+            shape = CODE_PRESENT
+            root = None
+        # A present array's root is not known until its slots exist; the
+        # device row temporarily records an empty array inside this same
+        # transaction, then is updated to "present".
+        self.conn.execute(
+            "INSERT INTO device(device_key, section_shape, section_root) "
+            "VALUES (?, ?, ?)",
+            (device_key, CODE_EMPTY if shape == CODE_PRESENT else shape, root),
+        )
+        if shape == CODE_PRESENT:
+            root = self._import_section_array(
+                device_key, normalized.section, id_factory, stats
+            )
+            self.conn.execute(
+                "UPDATE device SET section_shape = ?, section_root = ? "
+                "WHERE device_key = ?",
+                (CODE_PRESENT, root, device_key),
+            )
 
     def _import_section_array(
         self,
@@ -1535,6 +1603,178 @@ class DeviceStore:
         # array needs O(log n) memory rather than a full node cache.
         doc["section"] = [self._slot_document(sid) for sid in treap.inorder_ids()]
         return doc
+
+    # -- identified drafts: checkout and three-way merge -------------------
+    def checkout_document(self, device_key: str) -> Dict[str, Any]:
+        """The identified draft of one device, from a single consistent read.
+
+        Every array element (holes included) carries its stable slot id, so
+        the draft can serve as the base, local, or returned input of an
+        offline three-way merge.  The whole read runs inside one
+        transaction: sections and attachments never come from different
+        moments of a concurrent edit.
+        """
+        with self._transaction():
+            draft = self._read_draft(device_key)
+        return draft_to_json(draft)
+
+    def _read_draft(self, device_key: str) -> Draft:
+        """Bulk-read one device into a normalized draft (in a transaction)."""
+        row = self.conn.execute(
+            "SELECT section_shape, section_root FROM device WHERE device_key = ?",
+            (device_key,),
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"device {device_key!r} does not exist")
+        shape, root = row
+        if shape == CODE_ABSENT:
+            return Draft(key=device_key, section=ABSENT)
+        if shape == CODE_NULL:
+            return Draft(key=device_key, section=None)
+        section_rows = self.conn.execute(
+            "SELECT slot_id, left_id, right_id, is_hole, fields_json, "
+            "att_shape, att_root FROM section_slot WHERE device_key = ?",
+            (device_key,),
+        ).fetchall()
+        section_by_id = {r[0]: r for r in section_rows}
+        order = _walk_rows(section_by_id, root, 1, 2, f"section of {device_key}")
+        attachment_rows = self.conn.execute(
+            "SELECT a.slot_id, a.section_slot_id, a.left_id, a.right_id, "
+            "a.is_hole, a.fields_json FROM attachment_slot a "
+            "JOIN section_slot s ON a.section_slot_id = s.slot_id "
+            "WHERE s.device_key = ?",
+            (device_key,),
+        ).fetchall()
+        attachments_by_owner: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
+        for r in attachment_rows:
+            attachments_by_owner.setdefault(r[1], {})[r[0]] = r
+        slots: List[SlotDraft] = []
+        for slot_id in order:
+            _, _, _, is_hole, fields_json, att_shape, att_root = section_by_id[slot_id]
+            if is_hole:
+                slots.append(SlotDraft(slot_id, True, (), ABSENT))
+                continue
+            fields = _stored_fields(fields_json)
+            if att_shape == CODE_ABSENT:
+                attachments: Any = ABSENT
+            elif att_shape == CODE_NULL:
+                attachments = None
+            elif att_shape == CODE_EMPTY:
+                attachments = ()
+            else:
+                owner_rows = attachments_by_owner.get(slot_id, {})
+                att_order = _walk_rows(
+                    owner_rows, att_root, 2, 3, f"attachments of {slot_id}"
+                )
+                attachments = tuple(
+                    AttDraft(
+                        aid,
+                        bool(owner_rows[aid][4]),
+                        () if owner_rows[aid][4] else _stored_fields(owner_rows[aid][5]),
+                    )
+                    for aid in att_order
+                )
+            if att_shape != CODE_PRESENT and attachments_by_owner.get(slot_id):
+                raise IntegrityError(
+                    f"{slot_id}: non-present attachments still have slot rows"
+                )
+            slots.append(SlotDraft(slot_id, False, fields, attachments))
+        return Draft(key=device_key, section=tuple(slots))
+
+    def merge_document(
+        self,
+        device_key: str,
+        base_raw: Any,
+        local_raw: Any,
+        theirs_raw: Any,
+    ) -> Dict[str, int]:
+        """Three-way merge of one device's drafts, written back atomically.
+
+        Planning is pure and happens before any write.  The write-back is a
+        compare-and-swap: inside one transaction the store's current draft
+        must still equal the submitted local draft, and no merged slot id
+        may belong to another device; otherwise nothing changes.  Only the
+        target device's rows are rewritten, with their original identities.
+        """
+        base = parse_draft(base_raw, "base")
+        local = parse_draft(local_raw, "local")
+        theirs = parse_draft(theirs_raw, "theirs")
+        for label, draft in (("base", base), ("local", local), ("theirs", theirs)):
+            if draft.key != device_key:
+                raise ValidationError(
+                    f"{label} draft is for device {draft.key!r}, not {device_key!r}"
+                )
+        merged = merge_drafts(base, local, theirs)
+        with self._transaction():
+            current = self._read_draft(device_key)
+            if current != local:
+                raise StaleLocal(
+                    "the store no longer matches the local draft: "
+                    + first_difference(current, local)
+                )
+            self._assert_ids_not_owned_elsewhere(device_key, merged)
+            stats = self._replace_identified(device_key, merged)
+        return stats
+
+    def _assert_ids_not_owned_elsewhere(
+        self, device_key: str, draft: Draft
+    ) -> None:
+        """No merged slot id may collide with another device in this store."""
+        ids = list(draft_ids(draft))
+        chunk = 500
+        for start in range(0, len(ids), chunk):
+            part = ids[start : start + chunk]
+            marks = ",".join("?" * len(part))
+            rows = self.conn.execute(
+                f"SELECT slot_id, device_key FROM section_slot "
+                f"WHERE slot_id IN ({marks})",
+                part,
+            ).fetchall()
+            rows += self.conn.execute(
+                f"SELECT a.slot_id, s.device_key FROM attachment_slot a "
+                f"JOIN section_slot s ON a.section_slot_id = s.slot_id "
+                f"WHERE a.slot_id IN ({marks})",
+                part,
+            ).fetchall()
+            for slot_id, owner in rows:
+                if owner != device_key:
+                    raise MergeConflict(
+                        f"merged slot id {slot_id!r} already belongs to "
+                        f"device {owner!r}"
+                    )
+
+    def _replace_identified(self, device_key: str, draft: Draft) -> Dict[str, int]:
+        """Replace one device with a merged draft, keeping its slot ids.
+
+        Runs inside the caller's transaction.  The id plan replays the
+        draft's identities through the ordinary import path in exactly the
+        order the import consumes them.
+        """
+        normalized = normalize_device_doc(device_key, draft_to_plain_document(draft))
+        plan = draft_import_ids(draft)
+        cursor = {"position": 0}
+
+        def id_factory(kind: str, ordinal: int) -> str:
+            position = cursor["position"]
+            if position >= len(plan):
+                raise IntegrityError("merge id plan exhausted during import")
+            expected_kind, slot_id = plan[position]
+            if kind != expected_kind:
+                raise IntegrityError(
+                    f"merge id plan mismatch at {position}: expected "
+                    f"{expected_kind}, got {kind}"
+                )
+            cursor["position"] = position + 1
+            return slot_id
+
+        stats = {"section_slots": 0, "attachment_slots": 0}
+        self._replace_document_rows(
+            device_key, normalized, id_factory, replace=True, stats=stats
+        )
+        if cursor["position"] != len(plan):
+            raise IntegrityError("merge id plan was not fully consumed")
+        return stats
+
 
     def slot_view(self, slot_id: str) -> Dict[str, Any]:
         """Current identity, kind, owner and absolute position of a slot."""

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from .codec import StoreError, ValidationError
 from .export import export_csv
+from .merge import MergeConflict, StaleLocal
 from .store import BatchAborted, DeviceStore, Edit, NotFound
 
 
@@ -80,6 +81,36 @@ def cmd_show(args: argparse.Namespace) -> int:
         sys.stdout.write("\n")
     else:
         _print(document)
+    return 0
+
+
+def cmd_checkout(args: argparse.Namespace) -> int:
+    store = _open(args)
+    try:
+        draft = store.checkout_document(args.device)
+    finally:
+        store.close()
+    indent = None if args.compact else 2
+    text = json.dumps(draft, ensure_ascii=False, sort_keys=True, indent=indent)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+        _print({"checked_out": args.device, "output": args.output})
+    else:
+        sys.stdout.write(text + "\n")
+    return 0
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    base = _load_json(args.base)
+    local = _load_json(args.local)
+    theirs = _load_json(args.theirs)
+    store = _open(args)
+    try:
+        stats = store.merge_document(args.device, base, local, theirs)
+    finally:
+        store.close()
+    _print({"merged": args.device, **stats})
     return 0
 
 
@@ -182,6 +213,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--compact", action="store_true")
     p.set_defaults(func=cmd_show)
 
+    p = sub.add_parser(
+        "checkout", help="write the identified draft of one device (for merging)"
+    )
+    p.add_argument("device")
+    p.add_argument(
+        "-o", "--output", help="write the draft here instead of stdout"
+    )
+    p.add_argument("--compact", action="store_true")
+    p.set_defaults(func=cmd_checkout)
+
+    p = sub.add_parser(
+        "merge",
+        help="three-way merge of BASE/LOCAL/THEIRS drafts into one device",
+    )
+    p.add_argument("device")
+    p.add_argument("base", help="JSON file with the base draft, or -")
+    p.add_argument("local", help="JSON file with the local draft, or -")
+    p.add_argument("theirs", help="JSON file with the returned draft, or -")
+    p.set_defaults(func=cmd_merge)
+
     p = sub.add_parser("slot", help="look a slot up by its stable id")
     p.add_argument("slot_id")
     p.set_defaults(func=cmd_slot)
@@ -217,6 +268,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except MergeConflict as exc:
+        _print({"error": "merge_conflict", "detail": str(exc)})
+        return 6
+    except StaleLocal as exc:
+        _print({"error": "stale_local", "detail": str(exc)})
+        return 7
     except BatchAborted as exc:
         _print({"error": "batch_aborted", "detail": str(exc)})
         return 2

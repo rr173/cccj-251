@@ -86,6 +86,8 @@ python -m inspection_store --store store.db init
 python -m inspection_store --store store.db import D1 doc.json
 python -m inspection_store --store store.db apply D1 edits.json
 python -m inspection_store --store store.db show D1
+python -m inspection_store --store store.db checkout D1 [-o draft.json] [--compact]
+python -m inspection_store --store store.db merge D1 base.json local.json theirs.json
 python -m inspection_store --store store.db slot SLOT_ID
 python -m inspection_store --store store.db shape D1 [--section SLOT_ID]
 python -m inspection_store --store store.db page D1 1000 1010 [--section SLOT_ID] [--stats]
@@ -107,7 +109,65 @@ above, e.g.
 ]}
 ```
 
-Exit codes: `0` ok, `2` batch aborted, `3` not found, `4` invalid input.
+Exit codes: `0` ok, `2` batch aborted, `3` not found, `4` invalid input,
+`5` missing file, `6` merge conflict, `7` local draft stale.
+
+## Offline merge (checkout / merge)
+
+Two crews can take the same device draft offline and hand back modified
+copies; the store merges them for one device instead of overwriting one
+copy with the other.
+
+`checkout` writes the device's **identified draft**: the same nested shape
+as `show`, but every array element — holes included — carries its stable
+slot id:
+
+```json
+{"key": "D1",
+ "section": [
+   {"id": "s_…", "slot": null},
+   {"id": "s_…", "slot": {"fields": {"torque": 10},
+                           "attachments": [
+                             {"id": "s_…", "slot": {"photo": "front"}}]}}]}
+```
+
+Absent, `null`, `[]` and populated arrays stay distinct at both levels, and
+a slot id appears at most once in one draft.  The read behind `checkout`
+is a single transaction, so a draft never mixes sections and attachments
+from different moments of a concurrent edit.
+
+`merge` plans a three-way merge from the **base** draft both crews started
+from, the **local** draft (what the store must still contain) and the
+**returned** draft, then writes the result back in one transaction:
+
+* changes are judged by stable slot id, never by position or JSON key
+  order;
+* a field changed on one side is taken from that side, changed identically
+  on both sides is taken once, changed differently is a conflict — field
+  additions and removals count as changes;
+* a base slot deleted on only one side stays deleted only if the other
+  side left the slot and everything under it untouched (inserting
+  neighbours in the parent array is fine; adding, removing or editing its
+  attachments is a conflict);
+* arrays merge slot by slot: each new slot follows the nearest preceding
+  base slot of its own draft that survives the merge (array start when
+  there is none); at one anchor the local side's newcomers come first,
+  each side keeping its own order — a newcomer is never lost or
+  re-parented because its neighbour was deleted, and a merged array with
+  zero slots is still an empty array;
+* base slots may not be moved across arrays, re-holed or reordered inside
+  a branch — that is invalid input, as is a malformed draft;
+* the same new id on both sides, or a merged id owned by another device in
+  the store, is reported — never silently merged or renumbered;
+* planning is O(slots): one pass per array with id maps, no slot pairs, so
+  drafts with tens of thousands of slots merge quickly.
+
+The write-back is compare-and-swap: if the device in the store no longer
+equals the submitted local draft (another process recorded more in the
+meantime), the merge fails with `stale_local` and changes nothing.  Only
+the target device is rewritten, with its original identities; afterwards
+`show`, `page`, `slot`, `export` and `verify` see the merged shape and
+final order as usual.
 
 ## Tests
 
@@ -135,9 +195,10 @@ start.
 
 ```
 inspection_store/codec.py    validation + document shape rules
-inspection_store/store.py    schema, treap, batches, reads, verify
+inspection_store/merge.py    identified drafts + three-way merge planning
+inspection_store/store.py    schema, treap, batches, reads, verify, checkout/merge write-back
 inspection_store/export.py   streaming CSV export with final positions
 inspection_store/cli.py      command line interface
-tests/                       unit, simulation, batch, scale, integrity, CLI tests
+tests/                       unit, simulation, batch, scale, integrity, merge, CLI tests
 scripts/demo.py              narrated end-to-end acceptance demo
 ```

@@ -30,6 +30,7 @@ from .codec import (
     CODE_NULL,
     CODE_PRESENT,
 )
+from .merge import MergeConflict, StaleLocal
 from .store import (
     BatchAborted,
     DeviceStore,
@@ -50,7 +51,9 @@ __all__ = [
     "DuplicateIdentity",
     "Edit",
     "IntegrityError",
+    "MergeConflict",
     "NotFound",
+    "StaleLocal",
     "StoreError",
     "ValidationError",
     "new_slot_id",
