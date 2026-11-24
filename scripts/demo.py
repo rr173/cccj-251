@@ -26,6 +26,7 @@ from inspection_store import (  # noqa: E402
     DeviceStore,
     Edit,
     StaleLocal,
+    synchronize,
 )
 from inspection_store.export import export_csv  # noqa: E402
 
@@ -230,6 +231,40 @@ def main() -> int:
     store.verify()
     print("verify: ok")
     store.close()
+
+    heading("11. incremental sync into a read-only analysis database")
+    import sqlite3
+
+    analysis = os.path.join(scratch, "analysis.db")
+    first = synchronize(db, analysis)
+    print("first sync:", {k: first[k] for k in
+          ("devices_inserted", "devices_updated", "section_slots_written")})
+    # A second sync with no source change reads no record bodies.
+    idle = synchronize(db, analysis)
+    print("idle sync is a no-op:", idle["already_current"],
+          "slots written:", idle["section_slots_written"])
+
+    # Change one device, then confirm only that device is rewritten and the
+    # analysis relations expose the source version of every device.
+    store = DeviceStore(db)
+    store.apply_batch("HIST", [Edit.insert_section("SYNC-NEW", slot={"fields": {"v": 3}})])
+    store.close()
+    refreshed = synchronize(db, analysis)
+    print("refresh:", {k: refreshed[k] for k in
+          ("devices_updated", "devices_deleted", "section_slots_written")})
+    conn = sqlite3.connect(analysis)
+    versions = dict(conn.execute("SELECT device_key, source_version FROM device"))
+    print("source versions in analysis DB:", versions)
+    row = conn.execute(
+        "SELECT position, fields_json FROM section_slot "
+        "WHERE section_slot_id = 'SYNC-NEW'"
+    ).fetchone()
+    assert row is not None
+    print("new slot materialized at position", row[0], "with", row[1])
+    # The analysis tables have exactly the formal export columns plus version.
+    assert [c[1] for c in conn.execute("PRAGMA table_info(device)")][-1] == \
+        "source_version"
+    conn.close()
 
     print(f"\nAll demo assertions passed. Scratch data: {scratch}")
     return 0

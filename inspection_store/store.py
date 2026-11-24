@@ -1804,66 +1804,7 @@ class DeviceStore:
 
     def _read_draft(self, device_key: str) -> Draft:
         """Bulk-read one device into a normalized draft (in a transaction)."""
-        row = self.conn.execute(
-            "SELECT section_shape, section_root FROM device WHERE device_key = ?",
-            (device_key,),
-        ).fetchone()
-        if row is None:
-            raise NotFound(f"device {device_key!r} does not exist")
-        shape, root = row
-        if shape == CODE_ABSENT:
-            return Draft(key=device_key, section=ABSENT)
-        if shape == CODE_NULL:
-            return Draft(key=device_key, section=None)
-        section_rows = self.conn.execute(
-            "SELECT slot_id, left_id, right_id, is_hole, fields_json, "
-            "att_shape, att_root FROM section_slot WHERE device_key = ?",
-            (device_key,),
-        ).fetchall()
-        section_by_id = {r[0]: r for r in section_rows}
-        order = _walk_rows(section_by_id, root, 1, 2, f"section of {device_key}")
-        attachment_rows = self.conn.execute(
-            "SELECT a.slot_id, a.section_slot_id, a.left_id, a.right_id, "
-            "a.is_hole, a.fields_json FROM attachment_slot a "
-            "JOIN section_slot s ON a.section_slot_id = s.slot_id "
-            "WHERE s.device_key = ?",
-            (device_key,),
-        ).fetchall()
-        attachments_by_owner: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
-        for r in attachment_rows:
-            attachments_by_owner.setdefault(r[1], {})[r[0]] = r
-        slots: List[SlotDraft] = []
-        for slot_id in order:
-            _, _, _, is_hole, fields_json, att_shape, att_root = section_by_id[slot_id]
-            if is_hole:
-                slots.append(SlotDraft(slot_id, True, (), ABSENT))
-                continue
-            fields = _stored_fields(fields_json)
-            if att_shape == CODE_ABSENT:
-                attachments: Any = ABSENT
-            elif att_shape == CODE_NULL:
-                attachments = None
-            elif att_shape == CODE_EMPTY:
-                attachments = ()
-            else:
-                owner_rows = attachments_by_owner.get(slot_id, {})
-                att_order = _walk_rows(
-                    owner_rows, att_root, 2, 3, f"attachments of {slot_id}"
-                )
-                attachments = tuple(
-                    AttDraft(
-                        aid,
-                        bool(owner_rows[aid][4]),
-                        () if owner_rows[aid][4] else _stored_fields(owner_rows[aid][5]),
-                    )
-                    for aid in att_order
-                )
-            if att_shape != CODE_PRESENT and attachments_by_owner.get(slot_id):
-                raise IntegrityError(
-                    f"{slot_id}: non-present attachments still have slot rows"
-                )
-            slots.append(SlotDraft(slot_id, False, fields, attachments))
-        return Draft(key=device_key, section=tuple(slots))
+        return _read_draft_from_conn(self.conn, device_key)
 
     def merge_document(
         self,
@@ -2558,3 +2499,72 @@ class DeviceStore:
                 ):
                     raise IntegrityError(f"{label}: heap property broken at {sid!r}")
         return
+
+
+def _read_draft_from_conn(conn: sqlite3.Connection, device_key: str) -> Draft:
+    """Bulk-read one device into a normalized draft (in the caller's transaction).
+
+    The connection may be read-only: nothing here writes, so the synchronization
+    tool can rebuild a draft through a ``mode=ro`` connection and prove it can
+    never mutate the source store.
+    """
+    row = conn.execute(
+        "SELECT section_shape, section_root FROM device WHERE device_key = ?",
+        (device_key,),
+    ).fetchone()
+    if row is None:
+        raise NotFound(f"device {device_key!r} does not exist")
+    shape, root = row
+    if shape == CODE_ABSENT:
+        return Draft(key=device_key, section=ABSENT)
+    if shape == CODE_NULL:
+        return Draft(key=device_key, section=None)
+    section_rows = conn.execute(
+        "SELECT slot_id, left_id, right_id, is_hole, fields_json, "
+        "att_shape, att_root FROM section_slot WHERE device_key = ?",
+        (device_key,),
+    ).fetchall()
+    section_by_id = {r[0]: r for r in section_rows}
+    order = _walk_rows(section_by_id, root, 1, 2, f"section of {device_key}")
+    attachment_rows = conn.execute(
+        "SELECT a.slot_id, a.section_slot_id, a.left_id, a.right_id, "
+        "a.is_hole, a.fields_json FROM attachment_slot a "
+        "JOIN section_slot s ON a.section_slot_id = s.slot_id "
+        "WHERE s.device_key = ?",
+        (device_key,),
+    ).fetchall()
+    attachments_by_owner: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
+    for r in attachment_rows:
+        attachments_by_owner.setdefault(r[1], {})[r[0]] = r
+    slots: List[SlotDraft] = []
+    for slot_id in order:
+        _, _, _, is_hole, fields_json, att_shape, att_root = section_by_id[slot_id]
+        if is_hole:
+            slots.append(SlotDraft(slot_id, True, (), ABSENT))
+            continue
+        fields = _stored_fields(fields_json)
+        if att_shape == CODE_ABSENT:
+            attachments: Any = ABSENT
+        elif att_shape == CODE_NULL:
+            attachments = None
+        elif att_shape == CODE_EMPTY:
+            attachments = ()
+        else:
+            owner_rows = attachments_by_owner.get(slot_id, {})
+            att_order = _walk_rows(
+                owner_rows, att_root, 2, 3, f"attachments of {slot_id}"
+            )
+            attachments = tuple(
+                AttDraft(
+                    aid,
+                    bool(owner_rows[aid][4]),
+                    () if owner_rows[aid][4] else _stored_fields(owner_rows[aid][5]),
+                )
+                for aid in att_order
+            )
+        if att_shape != CODE_PRESENT and attachments_by_owner.get(slot_id):
+            raise IntegrityError(
+                f"{slot_id}: non-present attachments still have slot rows"
+            )
+        slots.append(SlotDraft(slot_id, False, fields, attachments))
+    return Draft(key=device_key, section=tuple(slots))

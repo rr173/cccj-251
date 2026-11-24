@@ -134,6 +134,7 @@ python -m inspection_store --store store.db slot SLOT_ID
 python -m inspection_store --store store.db shape D1 [--section SLOT_ID]
 python -m inspection_store --store store.db page D1 1000 1010 [--section SLOT_ID] [--stats]
 python -m inspection_store --store store.db export OUTDIR [DEVICE ...]
+python -m inspection_store --store store.db sync ANALYSIS.db
 python -m inspection_store --store store.db verify
 python -m inspection_store --store store.db counts
 python -m inspection_store --store store.db versions D1
@@ -155,7 +156,74 @@ above, e.g.
 ```
 
 Exit codes: `0` ok, `2` batch aborted, `3` not found, `4` invalid input,
-`5` missing file, `6` merge conflict, `7` local draft stale.
+`5` missing file, `6` merge conflict, `7` local draft stale, `8` sync could
+not publish (another sync in progress, or an older read view would overwrite
+a newer published result).
+
+## Analysis database sync
+
+Analysts run SQL against the three formal relations without touching the live
+store. The `sync` command maintains a separate, independent SQLite database
+that mirrors the store's current records, and is safe to repeat against the
+same source/target pair:
+
+```
+python -m inspection_store --store store.db sync analysis.db
+```
+
+The first run creates `analysis.db` from an empty target; every later run
+performs an incremental refresh. The source store is opened through a
+read-only (`mode=ro`) connection and is never modified, so syncs can run
+alongside normal inspection work. Only a history-enabled store is accepted:
+an older database is migrated in place the first time a current `DeviceStore`
+opens it, after which it can be synchronized.
+
+The analysis database exposes the same three relations the formal CSV export
+writes, with identical column order and semantics (final positions
+materialized, holes and the absent/null/empty/present shapes preserved), plus
+the source version each device record came from:
+
+| relation | columns |
+| --- | --- |
+| `device` | `device_key, section_shape, section_slot_count, source_version` |
+| `section_slot` | the eight export columns (`device_key, section_slot_id, device_section_shape, position, is_hole, fields_json, attachment_shape, section_slot_count`) |
+| `attachment_slot` | the seven export columns (`device_key, owner_section_slot_id, attachment_slot_id, section_position, position, is_hole, fields_json`) |
+
+`sync` reads the latest per-device version numbers in **one source read
+transaction**, so a published result always corresponds to a single committed
+view: array shapes, holes, stable slot identities, attachment ownership and
+final positions all come from that view. When several changes happen between
+syncs, only the latest result is published — including a restore to old
+content, which still mints a new version number.
+
+The incremental rules are:
+
+* the version list is the only full-store scan;
+* the live slot rows (the record bodies) are read only for devices whose
+  version differs from the published one, and historical version payloads are
+  never read;
+* unchanged devices are not rewritten — their analysis rows keep their
+  rowids;
+* a changed device's rows are replaced (children first, then the device row),
+  so a slot id deleted by one device and reused by another can only appear
+  under its new owner. The source API only ever adds devices, so the analysis
+  database never has to delete one; a read view that somehow lacks a device a
+  newer sync already published is rejected as stale rather than deleting it.
+
+The three relations and the synchronized-version bookkeeping are swapped in
+one write transaction, so a reader never sees a partially updated result. If
+publishing fails, the previous result stays queryable and a plain retry
+republishes everything; no progress is committed ahead of the transaction.
+Two overlapping syncs cannot interleave: the second one fails fast while the
+first holds the write lock, and an older source read view is never allowed to
+overwrite a newer published result. The analysis database is bound to one
+fixed source path and maintained solely by the tool; business-side access is
+read-only SQL, and pointing it at another source is rejected rather than
+mixed in.
+
+The same entry point is available from Python:
+`inspection_store.synchronize(source_path, analysis_path)`, returning counters
+for inserted, updated and deleted devices and the slot rows written.
 
 ## Offline merge (checkout / merge)
 
@@ -223,7 +291,10 @@ python3 -I scripts/demo.py --scale 100000
 
 `SCALE_N` (default 100000), `SIM_ROUNDS` (default 25) tune the scale and
 randomized acceptance runs. The scale run writes its SQLite file and export
-CSVs to a temp directory only; no large table is committed.
+CSVs to a temp directory only; no large table is committed. `SYNC_SCALE_N`
+(default 20000) sizes the two-device fixture the incremental sync scale tests
+use; like the rest of the suite it creates databases only in temp
+directories and the repository keeps no `.db`/`.sqlite` files.
 
 The randomized acceptance test compares the store after every batch against
 `tests/reference_model.py`, an independent model that is nothing but nested
@@ -244,8 +315,9 @@ inspection_store/merge.py    identified drafts + three-way merge planning
 inspection_store/store.py    schema, migration, treap, batches, reads, verify,
                              checkout/merge write-back, version history + restore
 inspection_store/export.py   streaming CSV export with final positions
+inspection_store/sync.py     read-only incremental sync into the analysis DB
 inspection_store/cli.py      command line interface
 tests/                       unit, simulation, batch, scale, integrity, merge,
-                             history and CLI tests
+                             history, sync and CLI tests
 scripts/demo.py              narrated end-to-end acceptance demo
 ```

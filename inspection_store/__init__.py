@@ -42,6 +42,12 @@ from .store import (
     NotFound,
     new_slot_id,
 )
+from .sync import (
+    SyncBusy,
+    SyncConflict,
+    SyncError,
+    synchronize,
+)
 
 __all__ = [
     "CODE_ABSENT",
@@ -57,6 +63,10 @@ __all__ = [
     "NotFound",
     "StaleLocal",
     "StoreError",
+    "SyncBusy",
+    "SyncConflict",
+    "SyncError",
     "ValidationError",
     "new_slot_id",
+    "synchronize",
 ]

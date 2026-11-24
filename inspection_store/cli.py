@@ -16,6 +16,7 @@ from .codec import StoreError, ValidationError
 from .export import export_csv
 from .merge import MergeConflict, StaleLocal
 from .store import BatchAborted, DeviceStore, Edit, NotFound
+from .sync import SyncBusy, SyncConflict, SyncError, synchronize
 
 
 def _load_json(path: str) -> Any:
@@ -225,6 +226,14 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    # The source is opened read-only inside synchronize(); never instantiate a
+    # read-write DeviceStore for it so the command cannot mutate the source.
+    report = synchronize(args.store, args.analysis)
+    _print({"synced": report})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m inspection_store",
@@ -327,6 +336,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("device")
     p.add_argument("version", type=int)
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser(
+        "sync",
+        help="incrementally mirror the store into a read-only analysis SQLite "
+        "database",
+    )
+    p.add_argument(
+        "analysis",
+        help="path to the analysis database (created on first sync, kept by "
+        "the tool afterwards)",
+    )
+    p.set_defaults(func=cmd_sync)
     return parser
 
 
@@ -335,6 +356,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except (SyncBusy, SyncConflict) as exc:
+        # 8: the sync could not be published (another sync in progress, or an
+        # older read view would overwrite a newer published result).
+        _print({"error": "sync_unavailable", "detail": str(exc)})
+        return 8
+    except SyncError as exc:
+        _print({"error": "sync_failed", "detail": str(exc)})
+        return 4
     except MergeConflict as exc:
         _print({"error": "merge_conflict", "detail": str(exc)})
         return 6

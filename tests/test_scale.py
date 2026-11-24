@@ -18,8 +18,12 @@ import unittest
 from helpers import TempStore
 from inspection_store import DeviceStore, Edit
 from inspection_store.export import export_csv
+from inspection_store import sync as sync_mod
 
 N = int(os.environ.get("SCALE_N", "100000"))
+# The sync scale test needs its own, smaller fixture so the whole suite stays
+# fast; the environment variable mirrors the main scale knob.
+SYNC_N = int(os.environ.get("SYNC_SCALE_N", "20000"))
 
 
 def build_large(store: DeviceStore, key: str, n: int) -> None:
@@ -136,6 +140,134 @@ class ScaleTests(unittest.TestCase):
         self.assertNotIn("pos", columns)
         self.assertTrue(os.path.exists(paths["device"]))
         self.assertTrue(os.path.exists(paths["attachment_slot"]))
+
+
+class SyncScaleTests(unittest.TestCase):
+    """The incremental sync avoids full-store work after the first copy."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = TempStore("sync-big.db")
+        cls.analysis = os.path.join(cls.tmp.directory, "analysis.db")
+        cls.store = cls.tmp.create()
+        # Two large devices so an unchanged one can be proven untouched.
+        cls.store.import_document(
+            "BIG1", {"section": [{"fields": {"i": i}} for i in range(SYNC_N)]}
+        )
+        cls.store.import_document(
+            "BIG2", {"section": [{"fields": {"i": i}} for i in range(SYNC_N)]}
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.store.close()
+
+    def test_first_sync_builds_the_full_copy(self) -> None:
+        start = time.time()
+        report = sync_mod.synchronize(self.tmp.path, self.analysis)
+        elapsed = time.time() - start
+        self.assertEqual(report["devices_inserted"], 2)
+        self.assertEqual(report["section_slots_written"], 2 * SYNC_N)
+        import sqlite3
+
+        conn = sqlite3.connect(self.analysis)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM section_slot").fetchone()[0],
+            2 * SYNC_N,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT MIN(position), MAX(position) FROM section_slot "
+                "WHERE device_key = 'BIG1'"
+            ).fetchall(),
+            [(0, SYNC_N - 1)],
+        )
+        conn.close()
+        # A full copy of tens of thousands of slots stays comfortably fast.
+        self.assertLess(elapsed, 60.0)
+
+    def test_second_sync_without_changes_reads_no_slot_bodies(self) -> None:
+        source = sync_mod.open_source_connection(self.tmp.path)
+        target = sync_mod.open_analysis_connection(self.analysis)
+        live = []
+
+        class TracingConn:
+            def __init__(self, real):
+                self.real = real
+
+            def execute(self, sql, parameters=()):
+                params = tuple(parameters) if parameters else ()
+                if sql.lstrip().upper().startswith("SELECT") and (
+                    "SECTION_SLOT" in sql.upper()
+                    or "ATTACHMENT_SLOT" in sql.upper()
+                ):
+                    live.append(sql)
+                return self.real.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.real, name)
+
+        published = sync_mod.read_published_versions(target)
+        snapshot = sync_mod.read_source_snapshot_from(
+            TracingConn(source), published
+        )
+        target.close()
+        source.close()
+        self.assertEqual(live, [])
+        self.assertEqual(set(snapshot.drafts), set())
+
+    def test_one_device_change_only_rewrites_that_device(self) -> None:
+        import sqlite3
+
+        conn = sqlite3.connect(self.analysis)
+        big2_rowids = [
+            r[0]
+            for r in conn.execute(
+                "SELECT rowid FROM section_slot WHERE device_key = 'BIG2' "
+                "ORDER BY rowid LIMIT 5"
+            )
+        ]
+        conn.close()
+
+        middle = self.store.page("BIG1", SYNC_N // 2, SYNC_N // 2 + 1)[0][
+            "slot_id"
+        ]
+        self.store.apply_batch(
+            "BIG1",
+            [Edit.insert_section("ONE", before=middle, slot={"fields": {"i": -1}})],
+        )
+        report = sync_mod.synchronize(self.tmp.path, self.analysis)
+        self.assertEqual(report["devices_updated"], 1)
+        self.assertEqual(report["devices_inserted"], 0)
+        # Only BIG1's slots are rewritten; BIG2's 20k rows never move.
+        self.assertEqual(report["section_slots_written"], SYNC_N + 1)
+
+        conn = sqlite3.connect(self.analysis)
+        after_big2 = [
+            r[0]
+            for r in conn.execute(
+                "SELECT rowid FROM section_slot WHERE device_key = 'BIG2' "
+                "ORDER BY rowid LIMIT 5"
+            )
+        ]
+        self.assertEqual(after_big2, big2_rowids)
+        self.assertEqual(
+            conn.execute(
+                "SELECT source_version FROM device WHERE device_key = 'BIG2'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT source_version FROM device WHERE device_key = 'BIG1'"
+            ).fetchone()[0],
+            2,
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM section_slot").fetchone()[0],
+            2 * SYNC_N + 1,
+        )
+        conn.close()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -257,6 +258,126 @@ class HistoryCliTests(unittest.TestCase):
             run("--store", self.store, "versions", "D1").stdout
         )["versions"]
         self.assertEqual([v["version_no"] for v in versions], [1, 2])
+
+
+class SyncCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = TempStore()
+        self.store = self.tmp.path
+        self.assertEqual(run("--store", self.store, "init").returncode, 0)
+        doc = self.tmp.directory
+        self.document = os.path.join(doc, "doc.json")
+        with open(self.document, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"section": [{"fields": {"n": 1}, "attachments": [{"a": 0}]}]},
+                handle,
+            )
+        self.assertEqual(
+            run("--store", self.store, "import", "D1", self.document).returncode,
+            0,
+        )
+        self.analysis = os.path.join(self.tmp.directory, "analysis.db")
+
+    def test_sync_command_creates_and_refreshes_analysis_database(self) -> None:
+        first = run("--store", self.store, "sync", self.analysis)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        payload = json.loads(first.stdout)["synced"]
+        self.assertEqual(payload["devices_total"], 1)
+        self.assertEqual(payload["devices_inserted"], 1)
+        self.assertTrue(os.path.exists(self.analysis))
+
+        conn = sqlite3.connect(self.analysis)
+        self.assertEqual(
+            conn.execute("SELECT device_key, source_version FROM device").fetchall(),
+            [("D1", 1)],
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM section_slot").fetchone()[0], 1
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM attachment_slot").fetchone()[0], 1
+        )
+        conn.close()
+
+        # A repeat sync without source changes is a no-op.
+        again = run("--store", self.store, "sync", self.analysis)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(json.loads(again.stdout)["synced"]["already_current"])
+
+        # A source change flows through on the next sync.
+        edits = os.path.join(self.tmp.directory, "edits.json")
+        with open(edits, "w", encoding="utf-8") as handle:
+            json.dump(
+                [{"op": "insert_section", "id": "S2", "slot": {"fields": {}}}],
+                handle,
+            )
+        self.assertEqual(
+            run("--store", self.store, "apply", "D1", edits).returncode, 0
+        )
+        updated = run("--store", self.store, "sync", self.analysis)
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        report = json.loads(updated.stdout)["synced"]
+        self.assertEqual(report["devices_updated"], 1)
+        conn = sqlite3.connect(self.analysis)
+        self.assertEqual(
+            conn.execute("SELECT source_version FROM device").fetchone()[0], 2
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM section_slot").fetchone()[0], 2
+        )
+        conn.close()
+
+    def test_sync_rejects_legacy_store_and_foreign_target(self) -> None:
+        from inspection_store.store import _LEGACY_SCHEMA_V1
+
+        legacy = os.path.join(self.tmp.directory, "legacy.db")
+        raw = sqlite3.connect(legacy)
+        raw.executescript(_LEGACY_SCHEMA_V1)
+        raw.execute("INSERT INTO meta(name, value) VALUES ('schema_version', '1')")
+        raw.commit()
+        raw.close()
+        result = run(
+            "--store", legacy, "sync",
+            os.path.join(self.tmp.directory, "legacy-analysis.db"),
+        )
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(json.loads(result.stdout)["error"], "sync_failed")
+
+        # A target already used for a different source is rejected.
+        run("--store", self.store, "sync", self.analysis)
+        other_store = os.path.join(self.tmp.directory, "other.db")
+        self.assertEqual(run("--store", other_store, "init").returncode, 0)
+        result = run("--store", other_store, "sync", self.analysis)
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(json.loads(result.stdout)["error"], "sync_failed")
+
+    def test_sync_stale_publish_returns_exit_code_8(self) -> None:
+        # Publish the real v1, then make the target claim an even newer
+        # version so a fresh source snapshot looks older than what is
+        # already published.  The CLI must refuse rather than downgrade.
+        self.assertEqual(
+            run("--store", self.store, "sync", self.analysis).returncode, 0
+        )
+        tampered = sqlite3.connect(self.analysis)
+        tampered.execute(
+            "UPDATE device SET source_version = 99 WHERE device_key = 'D1'"
+        )
+        tampered.commit()
+        tampered.close()
+        result = run("--store", self.store, "sync", self.analysis)
+        self.assertEqual(result.returncode, 8)
+        self.assertEqual(
+            json.loads(result.stdout)["error"], "sync_unavailable"
+        )
+        # The published rows were left untouched by the rejected sync.
+        conn = sqlite3.connect(self.analysis)
+        self.assertEqual(
+            conn.execute(
+                "SELECT source_version FROM device WHERE device_key = 'D1'"
+            ).fetchone()[0],
+            99,
+        )
+        conn.close()
 
 
 if __name__ == "__main__":
