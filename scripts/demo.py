@@ -167,7 +167,40 @@ def main() -> int:
     store.verify()
     print("verify: ok")
 
-    heading(f"9. {args.scale:,}-slot middle insert")
+    heading("9. version history: list, read, restore")
+    history_device = "HIST"
+    store.import_document(
+        history_device,
+        {"section": [{"fields": {"v": 1}, "attachments": [{"a": 1}]}]},
+    )
+    store.apply_batch(
+        history_device,
+        [Edit.insert_section("H-NEW", slot={"fields": {"v": 2}})],
+    )
+    versions = store.list_versions(history_device)
+    print("versions:", [(v["version_no"], v["kind"]) for v in versions])
+    print("version 1 record:", store.load_version(history_device, 1)["document"])
+    # A failed batch and a content-identical write both leave history alone.
+    try:
+        store.apply_batch(
+            history_device,
+            [Edit.insert_section("DUP", slot=None), Edit.insert_section("DUP", slot=None)],
+        )
+        print("ERROR: bad batch accepted")
+        return 1
+    except BatchAborted as exc:
+        print("failed batch appended no versions:", exc)
+    assert [v["version_no"] for v in store.list_versions(history_device)] == [1, 2]
+    stats = store.restore_version(history_device, 1)
+    print("restore v1 -> new version", stats["version_no"], "from", stats["restored_from"])
+    assert store.load_document(history_device) == store.load_version(history_device, 1)["document"]
+    assert [v["version_no"] for v in store.list_versions(history_device)] == [1, 2, 3]
+    # Restoring identical content is a no-op.
+    assert store.restore_version(history_device, 1)["versions_added"] == 0
+    store.verify()
+    print("verify: ok")
+
+    heading(f"10. {args.scale:,}-slot middle insert")
     start = time.time()
     store.import_document(
         "BIG", {"section": [{"fields": {"i": i}} for i in range(args.scale)]}

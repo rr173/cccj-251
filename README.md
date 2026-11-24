@@ -19,13 +19,14 @@ id and a position, so `[null]` and `[]` are different documents.
 
 ## What is stored
 
-Three tables, one row per element (holes included):
+The live document is held in three tables, one row per element (holes included):
 
 | table | holds |
 | --- | --- |
 | `device` | device key, section state, section root |
 | `section_slot` | section elements: fields, attachment state, array links |
 | `attachment_slot` | attachment elements: fields, links, owner's **stable id** |
+| `device_version` | append-only per-device history: one full identified draft per committed change |
 
 Arrays are ordered by an implicit treap kept in the slot rows
 (`left_id`/`right_id`/`parent_id`/`priority`/`subtree_size`). In-order
@@ -50,7 +51,48 @@ Edits are grouped into batches for one device and applied in a single
 transaction. Any bad reference, wrong-array reference, duplicate id, or
 operation on a non-array aborts the whole batch, so the store's visible state
 is exactly what it was before. A successful batch is durable and visible to a
-new process. There is no history.
+new process.
+
+## History and restore
+
+Every device carries an append-only version history in `device_version`.
+Opening an older database migrates it in place: each device's current record
+becomes a readable **baseline** version, the three live relations keep their
+shape, and all existing reads, edits, exports and merges keep working.
+
+A new version is appended only when one operation commits a **content change**
+for that device — a batch, an import (initial or `--replace`), an offline
+merge write-back, or a restore. The whole batch is one change and therefore
+one version. Failed operations append nothing (their transaction rolls back),
+and an operation whose result is content-identical to the current record
+appends nothing. Version numbers are per-device, gapless and ordered by
+commit time.
+
+Each version stores the full identified draft, so it preserves fields, the
+absent / null / empty / present array shapes, holes, array order, every
+stable slot id and attachment ownership. After a successful operation a fresh
+process sees both the current record and its matching history version;
+`verify` checks that the newest version always equals the live rows.
+
+`restore` rebuilds the current rows from an old version through the same
+identity-preserving write-back as a merge, so the record returns to that
+version's content *and* stable slot identities. History never moves
+backwards and no version is deleted: the restore is itself appended as a new
+latest version, and every earlier version stays readable. Restoring content
+identical to the current record changes nothing.
+
+```
+python -m inspection_store --store store.db versions D1
+python -m inspection_store --store store.db version D1 2
+python -m inspection_store --store store.db version D1 2 --identified
+python -m inspection_store --store store.db restore D1 1
+```
+
+The same capabilities are available from Python: `DeviceStore.list_versions`,
+`load_version`, `checkout_version` and `restore_version`. An unknown device or
+version raises `NotFound`; a non-integer or non-positive version raises
+`ValidationError`; in every error case neither the current record nor the
+history is modified.
 
 Supported operations (only these; turning an existing array back to
 absent/null is not supported):
@@ -94,6 +136,9 @@ python -m inspection_store --store store.db page D1 1000 1010 [--section SLOT_ID
 python -m inspection_store --store store.db export OUTDIR [DEVICE ...]
 python -m inspection_store --store store.db verify
 python -m inspection_store --store store.db counts
+python -m inspection_store --store store.db versions D1
+python -m inspection_store --store store.db version D1 N [--identified] [--compact]
+python -m inspection_store --store store.db restore D1 N
 ```
 
 `edits.json` is a list (or `{"edits": [...]}`) of edit objects as in the table
@@ -196,9 +241,11 @@ start.
 ```
 inspection_store/codec.py    validation + document shape rules
 inspection_store/merge.py    identified drafts + three-way merge planning
-inspection_store/store.py    schema, treap, batches, reads, verify, checkout/merge write-back
+inspection_store/store.py    schema, migration, treap, batches, reads, verify,
+                             checkout/merge write-back, version history + restore
 inspection_store/export.py   streaming CSV export with final positions
 inspection_store/cli.py      command line interface
-tests/                       unit, simulation, batch, scale, integrity, merge, CLI tests
+tests/                       unit, simulation, batch, scale, integrity, merge,
+                             history and CLI tests
 scripts/demo.py              narrated end-to-end acceptance demo
 ```

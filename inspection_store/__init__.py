@@ -18,8 +18,10 @@ stable slot ids.  Slot ids never imply an order; that is the whole point of
 having both.
 
 The store is intentionally minimal: batch edits only (insert slot, delete
-slot subtree, initialize an array to empty), no history, no way to turn an
-already-present array back into absent/null.
+slot subtree, initialize an array to empty) and no way to turn an
+already-present array back into absent/null.  Every successful content change
+is appended to a per-device, append-only version history that can be read and
+restored.
 """
 
 from .codec import (

@@ -134,7 +134,7 @@ class StoreFileTests(unittest.TestCase):
         with self.assertRaises(Exception):
             DeviceStore(tmp.path)
 
-    def test_no_history_tables(self) -> None:
+    def test_live_tables_have_no_position_column(self) -> None:
         tmp = TempStore()
         store = tmp.create()
         try:
@@ -144,7 +144,16 @@ class StoreFileTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            self.assertEqual(names, {"meta", "device", "section_slot", "attachment_slot"})
+            self.assertEqual(
+                names,
+                {
+                    "meta",
+                    "device",
+                    "section_slot",
+                    "attachment_slot",
+                    "device_version",
+                },
+            )
             columns = [
                 row[1]
                 for row in store.conn.execute("PRAGMA table_info(section_slot)")

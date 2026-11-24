@@ -186,6 +186,45 @@ def cmd_counts(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_versions(args: argparse.Namespace) -> int:
+    store = _open(args)
+    try:
+        versions = store.list_versions(args.device)
+    finally:
+        store.close()
+    _print({"device": args.device, "versions": versions})
+    return 0
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    store = _open(args)
+    try:
+        if args.identified:
+            payload = store.checkout_version(args.device, args.version)
+        else:
+            payload = store.load_version(args.device, args.version)
+    finally:
+        store.close()
+    if args.compact:
+        sys.stdout.write(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        )
+        sys.stdout.write("\n")
+    else:
+        _print(payload)
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    store = _open(args)
+    try:
+        stats = store.restore_version(args.device, args.version)
+    finally:
+        store.close()
+    _print({"restored": args.device, **stats})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m inspection_store",
@@ -260,6 +299,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("counts", help="row counts and device keys")
     p.set_defaults(func=cmd_counts)
+
+    p = sub.add_parser(
+        "versions", help="list the committed history versions of one device"
+    )
+    p.add_argument("device")
+    p.set_defaults(func=cmd_versions)
+
+    p = sub.add_parser(
+        "version", help="read one historical version of one device"
+    )
+    p.add_argument("device")
+    p.add_argument("version", type=int, help="version number (1 is the oldest)")
+    p.add_argument(
+        "--identified",
+        action="store_true",
+        help="emit the identified draft with stable slot ids instead of the "
+        "plain record",
+    )
+    p.add_argument("--compact", action="store_true")
+    p.set_defaults(func=cmd_version)
+
+    p = sub.add_parser(
+        "restore",
+        help="restore an old version; the restore is appended as a new version",
+    )
+    p.add_argument("device")
+    p.add_argument("version", type=int)
+    p.set_defaults(func=cmd_restore)
     return parser
 
 

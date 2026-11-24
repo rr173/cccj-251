@@ -2,7 +2,7 @@
 
 Storage model
 -------------
-Three tables hold the whole document shape:
+Three live tables hold the whole document shape:
 
 ``device``
     one row per device: the inspection-section state (absent / null / empty
@@ -16,6 +16,14 @@ Three tables hold the whole document shape:
 ``attachment_slot``
     one row per attachment array element, including holes.  It points at the
     *stable id* of its owning section slot, never at a section position.
+
+A fourth, append-only table holds the version history:
+
+``device_version``
+    one row per committed, content-changing version of a device: the full
+    identified draft (stable ids, fields, shapes, order and attachment
+    ownership) plus metadata and a content hash.  Rows are never updated or
+    deleted; restoring an old version appends a new version instead.
 
 Array order is represented as an implicit treap.  Each slot row stores
 ``parent_id`` / ``left_id`` / ``right_id`` / ``priority`` / ``subtree_size``.
@@ -32,10 +40,12 @@ unique across the two slot tables (enforced by triggers) and never change.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import (
     Any,
     Dict,
@@ -76,7 +86,7 @@ from .merge import (
     parse_draft,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SHAPE_NAMES = {
     CODE_ABSENT: "absent",
@@ -109,7 +119,95 @@ class IntegrityError(StoreError):
 # ---------------------------------------------------------------------------
 # Schema
 
+# Append-only history.  One row per committed, content-changing version of a
+# device.  Rows are never updated or deleted: restoring an old version appends
+# a new version instead of rewriting history, so version numbers always grow
+# in time order and stay readable.  The payload is the full identified draft
+# (every slot's stable id, fields, hole flag, attachment ownership and array
+# order), which is exactly what the merge write-back replays.
+_HISTORY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS device_version (
+    device_key      TEXT NOT NULL,
+    version_no      INTEGER NOT NULL CHECK (version_no >= 1),
+    created_at      TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    section_slots   INTEGER NOT NULL CHECK (section_slots >= 0),
+    attachment_slots INTEGER NOT NULL CHECK (attachment_slots >= 0),
+    draft_json      TEXT NOT NULL,
+    PRIMARY KEY (device_key, version_no)
+);
+"""
+
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    name  TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS device (
+    device_key    TEXT PRIMARY KEY,
+    section_shape INTEGER NOT NULL CHECK (section_shape IN (0, 1, 2, 3)),
+    section_root  TEXT,
+    CHECK ((section_shape = 3 AND section_root IS NOT NULL)
+        OR (section_shape <> 3 AND section_root IS NULL))
+);
+
+CREATE TABLE IF NOT EXISTS section_slot (
+    slot_id      TEXT PRIMARY KEY,
+    device_key   TEXT NOT NULL REFERENCES device(device_key) ON DELETE CASCADE,
+    parent_id    TEXT REFERENCES section_slot(slot_id) DEFERRABLE INITIALLY DEFERRED,
+    left_id      TEXT REFERENCES section_slot(slot_id) DEFERRABLE INITIALLY DEFERRED,
+    right_id     TEXT REFERENCES section_slot(slot_id) DEFERRABLE INITIALLY DEFERRED,
+    priority     INTEGER NOT NULL,
+    subtree_size INTEGER NOT NULL CHECK (subtree_size >= 1),
+    is_hole      INTEGER NOT NULL CHECK (is_hole IN (0, 1)),
+    fields_json  TEXT NOT NULL,
+    att_shape    INTEGER NOT NULL CHECK (att_shape IN (0, 1, 2, 3)),
+    att_root     TEXT,
+    CHECK (is_hole = 0 OR (fields_json = '{}' AND att_shape = 0 AND att_root IS NULL)),
+    CHECK ((att_shape = 3 AND att_root IS NOT NULL)
+        OR (att_shape <> 3 AND att_root IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS section_slot_device ON section_slot(device_key);
+CREATE INDEX IF NOT EXISTS section_slot_parent ON section_slot(parent_id);
+
+CREATE TABLE IF NOT EXISTS attachment_slot (
+    slot_id          TEXT PRIMARY KEY,
+    section_slot_id  TEXT NOT NULL REFERENCES section_slot(slot_id) ON DELETE CASCADE,
+    parent_id        TEXT REFERENCES attachment_slot(slot_id) DEFERRABLE INITIALLY DEFERRED,
+    left_id          TEXT REFERENCES attachment_slot(slot_id) DEFERRABLE INITIALLY DEFERRED,
+    right_id         TEXT REFERENCES attachment_slot(slot_id) DEFERRABLE INITIALLY DEFERRED,
+    priority         INTEGER NOT NULL,
+    subtree_size     INTEGER NOT NULL CHECK (subtree_size >= 1),
+    is_hole          INTEGER NOT NULL CHECK (is_hole IN (0, 1)),
+    fields_json      TEXT NOT NULL,
+    CHECK (is_hole = 0 OR fields_json = '{}')
+);
+
+CREATE INDEX IF NOT EXISTS attachment_slot_owner ON attachment_slot(section_slot_id);
+CREATE INDEX IF NOT EXISTS attachment_slot_parent ON attachment_slot(parent_id);
+
+CREATE TRIGGER IF NOT EXISTS section_id_not_attachment
+BEFORE INSERT ON section_slot
+WHEN EXISTS (SELECT 1 FROM attachment_slot WHERE slot_id = NEW.slot_id)
+BEGIN
+    SELECT RAISE(ABORT, 'duplicate slot identity');
+END;
+
+CREATE TRIGGER IF NOT EXISTS attachment_id_not_section
+BEFORE INSERT ON attachment_slot
+WHEN EXISTS (SELECT 1 FROM section_slot WHERE slot_id = NEW.slot_id)
+BEGIN
+    SELECT RAISE(ABORT, 'duplicate slot identity');
+END;
+""" + _HISTORY_TABLE_SQL
+
+# The v1 schema, kept verbatim so tests can build a legacy database and prove
+# that opening it upgrades the data in place.  Version 2 only adds the
+# device_version table; the three live relations are byte-for-byte the same.
+_LEGACY_SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS meta (
     name  TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -198,6 +296,34 @@ def priority_for(slot_id: str) -> int:
 def _stored_fields(fields_json: str) -> Tuple[Tuple[str, Any], ...]:
     """A stored fields_json as a sorted (name, scalar) tuple."""
     return tuple(sorted(loads_scalar(fields_json).items()))
+
+
+def _canonical_draft_json(draft: "Draft") -> str:
+    """Canonical JSON of an identified draft.
+
+    The canonical text carries everything a version must preserve: every
+    field, the four-way array shape (absent / null / empty / present, holes
+    included), each slot's stable identity, array order and attachment
+    ownership.  Two drafts with the same text are the same content, so it also
+    defines "no content change" for the history.
+    """
+    return json.dumps(
+        draft_to_json(draft),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _draft_slot_counts(draft: "Draft") -> Tuple[int, int]:
+    section_slots = 0
+    attachment_slots = 0
+    if isinstance(draft.section, tuple):
+        section_slots = len(draft.section)
+        for slot in draft.section:
+            if isinstance(slot.attachments, tuple):
+                attachment_slots += len(slot.attachments)
+    return section_slots, attachment_slots
 
 
 def _walk_rows(
@@ -1170,8 +1296,48 @@ class DeviceStore:
             ).fetchone()
         except sqlite3.DatabaseError as exc:
             raise StoreError("not an inspection store") from exc
-        if row is None or int(row[0]) != SCHEMA_VERSION:
+        if row is None:
             raise StoreError("not a supported inspection store")
+        try:
+            version = int(row[0])
+        except ValueError as exc:
+            raise StoreError("not a supported inspection store") from exc
+        if version > SCHEMA_VERSION:
+            raise StoreError(
+                f"store schema version {version} is newer than this software "
+                f"({SCHEMA_VERSION})"
+            )
+        if version < SCHEMA_VERSION:
+            self._migrate(version)
+
+    def _migrate(self, from_version: int) -> None:
+        """Upgrade an older database in place, inside one transaction.
+
+        The upgrade only *adds* history.  Every device already present becomes
+        version 1: its current rows are read with the ordinary draft reader and
+        snapshotted, so old data and every existing usage keep working while
+        the same history machinery serves new writes.  A failure rolls the
+        whole upgrade back and leaves the old database untouched.
+        """
+        if from_version != 1:
+            raise StoreError(
+                f"no migration path from schema version {from_version}"
+            )
+        with self._transaction():
+            self.conn.execute(_HISTORY_TABLE_SQL)
+            keys = [
+                r[0]
+                for r in self.conn.execute(
+                    "SELECT device_key FROM device ORDER BY device_key"
+                )
+            ]
+            for key in keys:
+                draft = self._read_draft(key)
+                self._insert_version(draft, "baseline")
+            self.conn.execute(
+                "UPDATE meta SET value = ? WHERE name = 'schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -1231,7 +1397,7 @@ class DeviceStore:
         }
 
     def dump_tables(self) -> Dict[str, List[Tuple[Any, ...]]]:
-        """Raw ordered snapshots of the three relations (for inspection/tests)."""
+        """Raw ordered snapshots of the four relations (for inspection/tests)."""
         return {
             "device": self.conn.execute(
                 "SELECT device_key, section_shape, section_root FROM device "
@@ -1246,6 +1412,11 @@ class DeviceStore:
                 "SELECT slot_id, section_slot_id, parent_id, left_id, right_id, "
                 "priority, subtree_size, is_hole, fields_json "
                 "FROM attachment_slot ORDER BY slot_id"
+            ).fetchall(),
+            "device_version": self.conn.execute(
+                "SELECT device_key, version_no, created_at, kind, content_hash, "
+                "section_slots, attachment_slots, draft_json "
+                "FROM device_version ORDER BY device_key, version_no"
             ).fetchall(),
         }
 
@@ -1303,9 +1474,17 @@ class DeviceStore:
 
         stats = {"section_slots": 0, "attachment_slots": 0}
         with self._transaction():
+            existed = self.conn.execute(
+                "SELECT 1 FROM device WHERE device_key = ?", (device_key,)
+            ).fetchone() is not None
+            previous = self._read_draft(device_key) if existed else None
             self._replace_document_rows(
                 device_key, normalized, id_factory, replace=replace, stats=stats
             )
+            recorded = self._record_version(
+                device_key, "import" if previous is None else "replace", previous
+            )
+            stats.update(recorded)
         return stats
 
     def _replace_document_rows(
@@ -1324,7 +1503,8 @@ class DeviceStore:
         if exists is not None:
             if not replace:
                 raise StoreError(f"device {device_key!r} already exists")
-            # Cascades remove slots; history is not kept.
+            # Cascades remove the live slots; device_version rows are kept so
+            # the pre-replacement history stays readable.
             self.conn.execute(
                 "DELETE FROM attachment_slot WHERE section_slot_id IN "
                 "(SELECT slot_id FROM section_slot WHERE device_key = ?)",
@@ -1493,8 +1673,10 @@ class DeviceStore:
                 "control_updated_rows": 0,
                 "nodes_loaded": 0,
                 "rows_written": 0,
+                "versions_added": 0,
             }
         with self._transaction():
+            previous = self._read_draft(device_key)
             session = _Session(self, device_key)
             try:
                 for edit in edit_list:
@@ -1503,7 +1685,9 @@ class DeviceStore:
                 # Leave the store untouched; convert to a batch error so the
                 # caller sees why the whole batch vanished.
                 raise BatchAborted(str(exc)) from exc
-            return session.finalize()
+            stats = session.finalize()
+            stats.update(self._record_version(device_key, "batch", previous))
+            return stats
 
     # -- reads -----------------------------------------------------------
     def _open_section_treap(self, device_key: str) -> Tuple[int, Optional[Treap]]:
@@ -1714,6 +1898,7 @@ class DeviceStore:
                 )
             self._assert_ids_not_owned_elsewhere(device_key, merged)
             stats = self._replace_identified(device_key, merged)
+            stats.update(self._record_version(device_key, "merge", current))
         return stats
 
     def _assert_ids_not_owned_elsewhere(
@@ -1773,6 +1958,191 @@ class DeviceStore:
         )
         if cursor["position"] != len(plan):
             raise IntegrityError("merge id plan was not fully consumed")
+        return stats
+
+    # -- history -----------------------------------------------------------
+    def _insert_version(self, draft: Draft, kind: str) -> int:
+        """Append one version row for an already-current draft.
+
+        Runs inside the caller's open transaction.  Version numbers are
+        per-device and gapless; the table is append-only, so no version row is
+        ever updated or deleted.
+        """
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(version_no), 0) FROM device_version "
+            "WHERE device_key = ?",
+            (draft.key,),
+        ).fetchone()
+        next_no = int(row[0]) + 1
+        canonical = _canonical_draft_json(draft)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        section_slots, attachment_slots = _draft_slot_counts(draft)
+        created_at = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "INSERT INTO device_version (device_key, version_no, created_at, "
+            "kind, content_hash, section_slots, attachment_slots, draft_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                draft.key,
+                next_no,
+                created_at,
+                kind,
+                digest,
+                section_slots,
+                attachment_slots,
+                canonical,
+            ),
+        )
+        return next_no
+
+    def _record_version(
+        self, device_key: str, kind: str, previous: Optional[Draft]
+    ) -> Dict[str, int]:
+        """Snapshot the device's current state unless it did not change.
+
+        Called only after a write transaction has put the rows in their final
+        state.  A failed write never gets here (its transaction rolls back),
+        and a write whose content is identical to the previous committed
+        state appends nothing — one batch/merge/import is one change, and no
+        change means no new version.  Returns the counters callers report.
+        """
+        current = self._read_draft(device_key)
+        current_canonical = _canonical_draft_json(current)
+        if previous is not None:
+            previous_canonical = _canonical_draft_json(previous)
+            if current_canonical == previous_canonical:
+                return {"versions_added": 0, "version_no": 0}
+        version_no = self._insert_version(current, kind)
+        return {"versions_added": 1, "version_no": version_no}
+
+    def _require_device(self, device_key: str) -> None:
+        row = self.conn.execute(
+            "SELECT 1 FROM device WHERE device_key = ?", (device_key,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"device {device_key!r} does not exist")
+
+    def list_versions(self, device_key: str) -> List[Dict[str, Any]]:
+        """Metadata for every version of one device, oldest version first.
+
+        Version numbers are per-device, gapless and ordered by commit time.
+        The last entry is the current record.
+        """
+        self._require_device(device_key)
+        rows = self.conn.execute(
+            "SELECT version_no, created_at, kind, content_hash, "
+            "section_slots, attachment_slots FROM device_version "
+            "WHERE device_key = ? ORDER BY version_no",
+            (device_key,),
+        ).fetchall()
+        return [
+            {
+                "device_key": device_key,
+                "version_no": row[0],
+                "created_at": row[1],
+                "kind": row[2],
+                "content_hash": row[3],
+                "section_slots": row[4],
+                "attachment_slots": row[5],
+            }
+            for row in rows
+        ]
+
+    def _version_row(self, device_key: str, version_no: Any) -> Tuple[Any, ...]:
+        if isinstance(version_no, bool) or not isinstance(version_no, int):
+            raise ValidationError(
+                f"version must be an integer, got {type(version_no).__name__}"
+            )
+        if version_no < 1:
+            raise ValidationError(f"version numbers start at 1, got {version_no}")
+        row = self.conn.execute(
+            "SELECT version_no, created_at, kind, content_hash, section_slots, "
+            "attachment_slots, draft_json FROM device_version "
+            "WHERE device_key = ? AND version_no = ?",
+            (device_key, version_no),
+        ).fetchone()
+        if row is None:
+            # Distinguish an unknown device from an out-of-range version so the
+            # reason is always reported precisely.
+            self._require_device(device_key)
+            latest = self.conn.execute(
+                "SELECT MAX(version_no) FROM device_version WHERE device_key = ?",
+                (device_key,),
+            ).fetchone()[0]
+            raise NotFound(
+                f"device {device_key!r} has no version {version_no} "
+                f"(versions 1..{latest})"
+            )
+        return row
+
+    def _load_version_draft(self, device_key: str, version_no: int) -> Draft:
+        row = self._version_row(device_key, version_no)
+        try:
+            return parse_draft(json.loads(row[6]), f"version {version_no}")
+        except (json.JSONDecodeError, StoreError) as exc:
+            raise IntegrityError(
+                f"stored version {version_no} of {device_key!r} is unreadable: {exc}"
+            ) from exc
+
+    def load_version(self, device_key: str, version_no: int) -> Dict[str, Any]:
+        """The full plain record (the same nested form as ``load_document``)
+        stored at one version, plus its version metadata.
+
+        Read-only: the current record and the history are never modified.
+        """
+        row = self._version_row(device_key, version_no)
+        draft = self._load_version_draft(device_key, version_no)
+        if draft.key != device_key:  # pragma: no cover - defensive
+            raise IntegrityError(
+                f"version {version_no} is stored under {device_key!r} but "
+                f"contains device {draft.key!r}"
+            )
+        document = draft_to_plain_document(draft)
+        document["key"] = device_key
+        return {
+            "device_key": device_key,
+            "version_no": row[0],
+            "created_at": row[1],
+            "kind": row[2],
+            "content_hash": row[3],
+            "section_slots": row[4],
+            "attachment_slots": row[5],
+            "document": document,
+        }
+
+    def checkout_version(self, device_key: str, version_no: int) -> Dict[str, Any]:
+        """The full identified draft (stable slot ids included) of one version.
+
+        This is the historical counterpart of :meth:`checkout_document`.
+        """
+        self._version_row(device_key, version_no)
+        return draft_to_json(self._load_version_draft(device_key, version_no))
+
+    def restore_version(
+        self, device_key: str, version_no: int
+    ) -> Dict[str, Any]:
+        """Restore one old version as the current record.
+
+        The current rows are rebuilt from the version's identified draft via
+        the same identity-preserving write-back as an offline merge: fields,
+        array shapes, hole membership, slot identities, order and attachment
+        ownership all return to what that version held.  History itself never
+        moves backwards and no old version is deleted: the restore is appended
+        as a new latest version.  Restoring content identical to the current
+        record changes nothing and appends nothing.
+        """
+        with self._transaction():
+            previous = self._read_draft(device_key)
+            draft = self._load_version_draft(device_key, version_no)
+            if draft.key != device_key:  # pragma: no cover - defensive
+                raise IntegrityError(
+                    f"version {version_no} belongs to device {draft.key!r}, "
+                    f"not {device_key!r}"
+                )
+            stats = self._replace_identified(device_key, draft)
+            recorded = self._record_version(device_key, "restore", previous)
+            stats.update(recorded)
+            stats["restored_from"] = version_no
         return stats
 
 
@@ -1939,8 +2309,14 @@ class DeviceStore:
 
     # -- integrity -------------------------------------------------------
     def verify(self) -> Dict[str, int]:
-        """Check all treap and shape invariants; raise IntegrityError if broken."""
-        checked = {"devices": 0, "section_arrays": 0, "attachment_arrays": 0}
+        """Check all treap, shape and history invariants; raise on any break."""
+        checked = {
+            "devices": 0,
+            "section_arrays": 0,
+            "attachment_arrays": 0,
+            "history_devices": 0,
+            "history_versions": 0,
+        }
         rows = self.conn.execute(
             "SELECT device_key, section_shape, section_root FROM device "
             "ORDER BY device_key"
@@ -1998,7 +2374,77 @@ class DeviceStore:
                         label=f"attachments of {sid}",
                     )
                     checked["attachment_arrays"] += 1
+        self._verify_history(checked)
         return checked
+
+    def _verify_history(self, checked: Dict[str, int]) -> None:
+        """History invariants: every device has gapless versions, stored payloads
+        are valid and self-consistent, and the newest version equals the live
+        rows, so a committed record and its history version always coexist.
+        """
+        version_rows = self.conn.execute(
+            "SELECT device_key, version_no, kind, content_hash, section_slots, "
+            "attachment_slots, draft_json FROM device_version "
+            "ORDER BY device_key, version_no"
+        ).fetchall()
+        grouped: Dict[str, List[Tuple[Any, ...]]] = {}
+        for row in version_rows:
+            grouped.setdefault(row[0], []).append(row)
+        live_keys = set(self.device_keys())
+        if set(grouped) != live_keys:
+            missing = sorted(live_keys - set(grouped))
+            extra = sorted(set(grouped) - live_keys)
+            raise IntegrityError(
+                f"history coverage mismatch (missing={missing}, extra={extra})"
+            )
+        for device_key, rows in grouped.items():
+            checked["history_devices"] += 1
+            expected_no = 1
+            newest_payload: Optional[str] = None
+            for _, version_no, kind, content_hash, sec_count, att_count, payload in rows:
+                if version_no != expected_no:
+                    raise IntegrityError(
+                        f"{device_key}: history jumps from "
+                        f"{expected_no - 1} to {version_no}"
+                    )
+                expected_no += 1
+                # The stored text is itself the canonical serialization, so the
+                # hash can be checked without a parse/reserialize round trip.
+                if (
+                    hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                    != content_hash
+                ):
+                    raise IntegrityError(
+                        f"{device_key}: version {version_no} content hash does not "
+                        "match its payload"
+                    )
+                try:
+                    draft = parse_draft(json.loads(payload), f"version {version_no}")
+                except (json.JSONDecodeError, StoreError) as exc:
+                    raise IntegrityError(
+                        f"{device_key}: version {version_no} payload is invalid: {exc}"
+                    ) from exc
+                if draft.key != device_key:
+                    raise IntegrityError(
+                        f"{device_key}: version {version_no} payload is for "
+                        f"{draft.key!r}"
+                    )
+                sec_slots, att_slots = _draft_slot_counts(draft)
+                if (sec_slots, att_slots) != (sec_count, att_count):
+                    raise IntegrityError(
+                        f"{device_key}: version {version_no} slot counters disagree "
+                        f"with its payload"
+                    )
+                newest_payload = payload
+                checked["history_versions"] += 1
+            # The newest historical version must be exactly what is live now:
+            # one canonicalization of the live rows, compared as text.
+            live_draft = self._read_draft(device_key)
+            if _canonical_draft_json(live_draft) != newest_payload:
+                raise IntegrityError(
+                    f"{device_key}: newest history version does not match the "
+                    "current record"
+                )
 
     def _verify_array(
         self,

@@ -157,5 +157,107 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["error"], "not_found")
 
 
+class HistoryCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = TempStore()
+        self.store = self.tmp.path
+        self.assertEqual(run("--store", self.store, "init").returncode, 0)
+        self.doc = self.write(
+            "doc.json",
+            {"section": [{"fields": {"n": 0}, "attachments": [{"a": 1}, None]}]},
+        )
+        self.assertEqual(
+            run("--store", self.store, "import", "D1", self.doc).returncode, 0
+        )
+        edits = self.write(
+            "edit.json",
+            [{"op": "insert_section", "id": "NEW", "slot": {"fields": {"n": 1}}}],
+        )
+        self.assertEqual(
+            run("--store", self.store, "apply", "D1", edits).returncode, 0
+        )
+
+    def write(self, name, payload):
+        path = os.path.join(self.tmp.directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        return path
+
+    def test_versions_list_and_read_and_restore(self) -> None:
+        listing = run("--store", self.store, "versions", "D1")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        versions = json.loads(listing.stdout)["versions"]
+        self.assertEqual([v["version_no"] for v in versions], [1, 2])
+        self.assertEqual([v["kind"] for v in versions], ["import", "batch"])
+        for entry in versions:
+            self.assertIn("created_at", entry)
+            self.assertIn("content_hash", entry)
+
+        first = run("--store", self.store, "version", "D1", "1", "--compact")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        payload = json.loads(first.stdout)
+        self.assertEqual(payload["version_no"], 1)
+        self.assertEqual(
+            payload["document"]["section"],
+            [{"fields": {"n": 0}, "attachments": [{"a": 1}, None]}],
+        )
+
+        identified = run("--store", self.store, "version", "D1", "1", "--identified")
+        draft = json.loads(identified.stdout)
+        self.assertEqual(draft["key"], "D1")
+        self.assertTrue(draft["section"][0]["id"])
+        # The attachment hole keeps its id in the historical draft.
+        self.assertIsNone(draft["section"][0]["slot"]["attachments"][1]["slot"])
+
+        result = run("--store", self.store, "restore", "D1", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stats = json.loads(result.stdout)
+        self.assertEqual(stats["versions_added"], 1)
+        self.assertEqual(stats["restored_from"], 1)
+
+        after = json.loads(
+            run("--store", self.store, "versions", "D1").stdout
+        )["versions"]
+        self.assertEqual([v["version_no"] for v in after], [1, 2, 3])
+        self.assertEqual(after[-1]["kind"], "restore")
+        current = json.loads(
+            run("--store", self.store, "show", "D1", "--compact").stdout
+        )
+        self.assertEqual(
+            current["section"],
+            [{"fields": {"n": 0}, "attachments": [{"a": 1}, None]}],
+        )
+        # Existing query/export/verify behavior still works alongside history.
+        self.assertEqual(
+            run("--store", self.store, "verify").returncode, 0
+        )
+        outdir = os.path.join(self.tmp.directory, "csv")
+        self.assertEqual(
+            run("--store", self.store, "export", outdir).returncode, 0
+        )
+
+    def test_invalid_version_and_device_exit_codes(self) -> None:
+        bad_version = run("--store", self.store, "version", "D1", "99")
+        self.assertEqual(bad_version.returncode, 3)
+        self.assertEqual(json.loads(bad_version.stdout)["error"], "not_found")
+
+        zero = run("--store", self.store, "version", "D1", "0")
+        self.assertEqual(zero.returncode, 4)
+        self.assertEqual(json.loads(zero.stdout)["error"], "invalid")
+
+        ghost = run("--store", self.store, "versions", "GHOST")
+        self.assertEqual(ghost.returncode, 3)
+        self.assertEqual(json.loads(ghost.stdout)["error"], "not_found")
+
+        restore_ghost = run("--store", self.store, "restore", "GHOST", "1")
+        self.assertEqual(restore_ghost.returncode, 3)
+
+        # The failed restore left the record and history alone.
+        versions = json.loads(
+            run("--store", self.store, "versions", "D1").stdout
+        )["versions"]
+        self.assertEqual([v["version_no"] for v in versions], [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()
